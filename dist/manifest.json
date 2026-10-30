@@ -1,27 +1,30 @@
 {
-  "name": "AHMEDSYNTRADERSITE",
-  "short_name": "AhmedSyn",
+  "name": "Digittrader",
+  "short_name": "Digittrader",
   "description": "Advanced AI Trading Platform on Deriv",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#000e06",
-  "theme_color": "#00ff88",
+  "background_color": "#FBF5E6",
+  "theme_color": "#0B5CFF",
   "orientation": "any",
   "icons": [
     {
-      "src": "/logo.jpeg",
+      "src": "/logo.png",
       "sizes": "192x192",
-      "type": "image/jpeg",
+      "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/logo.jpeg",
+      "src": "/logo.png",
       "sizes": "512x512",
-      "type": "image/jpeg",
+      "type": "image/png",
       "purpose": "any maskable"
     }
   ],
   "screenshots": [],
-  "categories": ["finance", "productivity"],
+  "categories": [
+    "finance",
+    "productivity"
+  ],
   "lang": "en"
 }

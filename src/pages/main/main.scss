@@ -33,12 +33,35 @@ body {
         max-width: 100%;
         width: 100%;
 
+        // The tab strip has many wide pills. Let its own overflow container
+        // scroll instead of allowing the tabs' min-content width to stretch
+        // the entire grid beyond the viewport on desktop.
+        > div:first-child {
+            width: 100%;
+            min-width: 0;
+            max-width: 100%;
+        }
+
         // Keep full-page tools inside the same viewport as the rest of the
         // application. Without an explicit flex height, the tab content can
         // collapse beneath the fixed header on desktop and narrow screens.
         > .dc-tabs--main__tabs {
             flex: 1 1 auto;
+            width: 100%;
             min-height: 0;
+            min-width: 0;
+            grid-template-columns: minmax(0, 1fr);
+        }
+
+        > .dc-tabs--main__tabs > .dc-tabs__list--header--main__tabs {
+            width: 100%;
+            max-width: 100%;
+            min-width: 0;
+        }
+
+        > .dc-tabs--main__tabs > .dc-tabs__list--header--main__tabs > .dc-tabs__list--main__tabs {
+            width: 100%;
+            max-width: 100%;
             min-width: 0;
         }
 

@@ -31,7 +31,7 @@
     "clsx": "^2.1.1",
     "crc-32": "^1.2.2",
     "debounce": "^2.2.0",
-    "dompurify": "^3.4.11",
+    "dompurify": "^3.4.17",
     "dotenv": "^16.6.1",
     "file-saver": "^2.0.5",
     "formik": "^2.4.9",
@@ -115,7 +115,7 @@
     "sass-loader": "^14.2.1",
     "stylelint": "^16.3.1",
     "stylelint-config-standard-scss": "^13.1.0",
-    "ts-jest": "^29.4.11",
+    "ts-jest": "^29.4.15",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }
