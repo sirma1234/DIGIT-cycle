@@ -23,7 +23,6 @@ import BotStopped from '../components/bot-stopped';
 import BotBuilder from '../pages/bot-builder';
 import Main from '../pages/main';
 import AIAssistant from '../components/ai-assistant';
-import InstallPrompt from '../components/install-prompt';
 import RiskDisclaimer from '../components/floating/RiskDisclaimer';
 // ── Global copy-trading boot ──────────────────────────────────────────────
 // Importing copy-trading initialises the bot-contract bridge (copy-trade-bridge.ts)
@@ -283,7 +282,6 @@ const AppContent = observer(() => {
                             <BotStopped />
                             <TransactionDetailsModal />
                             <ToastContainer limit={3} draggable={false} />
-                            <InstallPrompt />
                             <AIAssistant />
                             <RiskDisclaimer />
                         </div>

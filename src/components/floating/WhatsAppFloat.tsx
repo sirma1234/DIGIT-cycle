@@ -195,7 +195,7 @@ const StepNav = ({
 );
 
 /* ════════════════════════════════════════════════ */
-const WhatsAppFloat: React.FC = () => {
+const WhatsAppFloat: React.FC<{ hidden?: boolean }> = ({ hidden = false }) => {
     const [pos, setPos]             = useState(getDefaultPos);
     const [open, setOpen]           = useState(() => ls(SK_OPEN, false));
     const [tab, setTab]             = useState<'signals'|'pair'>('signals');
@@ -258,6 +258,7 @@ const WhatsAppFloat: React.FC = () => {
 
     /* ─── Auto-refresh ─── */
     useEffect(() => {
+        if (hidden) return;
         const refresh = () => {
             const sig = generateSignal(idRef.current++);
             setSignals(prev => [sig, ...prev].slice(0, 8));
@@ -267,7 +268,7 @@ const WhatsAppFloat: React.FC = () => {
         };
         timerRef.current = setInterval(() => setCountdown(c => { if (c <= 1) { refresh(); return 30; } return c - 1; }), 1000);
         return () => clearInterval(timerRef.current);
-    }, [maybeShare]);
+    }, [maybeShare, hidden]);
 
     /* ─── Live scalper signals ─── */
     useEffect(() => {
@@ -508,6 +509,8 @@ const WhatsAppFloat: React.FC = () => {
     };
 
     /* ════════ render ════════ */
+    if (hidden) return null;
+
     return (
         <>
             {/* FAB */}

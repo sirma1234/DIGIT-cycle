@@ -116,11 +116,6 @@ const FloatingRunButton: React.FC = observer(() => {
     const showResume = is_running && paused;
     const showStop   = is_running;
 
-    // The mobile run bar owns the idle/run affordance on supported pages.
-    // Keeping this floating surface hidden while idle prevents the old
-    // "○ Bot Idle" pill from covering page content on every mobile tab.
-    if (!isDesktop && !is_running) return null;
-
     return (
         <div
             ref={btnRef}
@@ -173,8 +168,10 @@ const FloatingRunButton: React.FC = observer(() => {
                         }
                     }}
                     title={is_running ? 'Stop bot' : 'Run bot'}
+                    aria-label={is_running ? 'Stop bot' : 'Run bot'}
                 >
-                    {is_running ? '⏹' : '▶'}
+                    <span aria-hidden='true'>{is_running ? '⏹' : '▶'}</span>
+                    <span className='floating-run-btn__btn-label'>{is_running ? 'Stop' : 'Run'}</span>
                 </button>
                 <button
                     className='floating-run-btn__collapse'

@@ -21,7 +21,6 @@ import { Header, useDevice, Wrapper } from '@deriv-com/ui';
 import { AppLogo } from '../app-logo';
 import AccountSwitcher from './account-switcher';
 import MobileMenu from './mobile-menu';
-import NavDrawer from '@/components/nav-drawer/NavDrawer';
 import './header.scss';
 
 const ApiTokenLoginModal = lazy(() => import('@/components/login-modal/api-token-login-modal'));
@@ -367,7 +366,6 @@ const AppHeader = observer(() => {
             >
                 <Wrapper variant='left'>
                     <MobileMenu onLogout={handleLogout} />
-                    <NavDrawer />
                     <AppLogo />
                     {isDesktop ? (
                         <>

@@ -45,7 +45,7 @@ body {
         // Keep full-page tools inside the same viewport as the rest of the
         // application. Without an explicit flex height, the tab content can
         // collapse beneath the fixed header on desktop and narrow screens.
-        > .dc-tabs--main__tabs {
+        > div > .dc-tabs--main__tabs {
             flex: 1 1 auto;
             width: 100%;
             min-height: 0;
@@ -53,19 +53,19 @@ body {
             grid-template-columns: minmax(0, 1fr);
         }
 
-        > .dc-tabs--main__tabs > .dc-tabs__list--header--main__tabs {
+        > div > .dc-tabs--main__tabs > .dc-tabs__list--header--main__tabs {
             width: 100%;
             max-width: 100%;
             min-width: 0;
         }
 
-        > .dc-tabs--main__tabs > .dc-tabs__list--header--main__tabs > .dc-tabs__list--main__tabs {
+        > div > .dc-tabs--main__tabs > .dc-tabs__list--header--main__tabs > .dc-tabs__list--main__tabs {
             width: 100%;
             max-width: 100%;
             min-width: 0;
         }
 
-        > .dc-tabs--main__tabs > .dc-tabs__content--main__tabs {
+        > div > .dc-tabs--main__tabs > .dc-tabs__content--main__tabs {
             min-height: 0;
             overflow-x: hidden;
             overflow-y: auto;
@@ -94,32 +94,32 @@ body {
                 margin: 0.2rem 0.4rem;
                 padding: 0.4rem 1.4rem;
                 border-radius: 999px;
-                background: #ffffff;
-                border: 1px solid rgba(0, 0, 0, 0.08);
+                background: #fff0e6;
+                border: 1px solid rgba(234, 88, 12, 0.22);
                 box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
-                color: #1f2937 !important;
+                color: #542a18 !important;
                 white-space: nowrap;
 
-                span, .dc-text { color: #1f2937; }
+                span, .dc-text { color: #542a18; }
             }
 
             &__active {
-                background: linear-gradient(135deg, #00a651 0%, #0b5cff 100%) !important;
+                background: linear-gradient(135deg, #f97316 0%, #dc2626 100%) !important;
                 color: #ffffff !important;
                 border-color: transparent;
-                box-shadow: 0 4px 12px rgba(11, 92, 255, 0.25);
+                box-shadow: 0 4px 12px rgba(234, 88, 12, 0.3);
 
                 span, .dc-text { color: #ffffff !important; }
             }
 
             &__list {
-                background: $color-cream;
+                background: #fff5ed;
                 justify-content: start;
                 padding: 0.4rem 0.8rem;
                 height: auto;
                 min-height: 5.2rem;
                 align-items: center;
-                border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+                border-bottom: 1px solid rgba(234, 88, 12, 0.18);
                 position: relative;
                 z-index: 30;
                 overflow-x: auto;
@@ -191,7 +191,10 @@ body {
 
                 @include flex-center;
 
-                &:hover:not(.dc-tabs__active) { color: #0b5cff !important; }
+                &:hover:not(.dc-tabs__active) {
+                    color: #c2410c !important;
+                    background: #ffe0ca;
+                }
 
                 svg {
                     padding-inline-end: 0;

@@ -198,11 +198,13 @@ const AppWrapper = observer(() => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [active_tab]);
 
-    // Keep the floating Run panel just below the tab bar so it never covers tabs.
+    // Anchor the fixed Run panel below the tab bar. Do not recalculate during
+    // scrolling: that made the panel move with the page instead of staying
+    // reachable in the viewport.
     useEffect(() => {
         const root = document.documentElement;
+        const list = document.querySelector('.dc-tabs__list--main__tabs, .dc-tabs__list.main__tabs--drawer-only');
         const update = () => {
-            const list = document.querySelector('.dc-tabs__list--main__tabs, .dc-tabs__list.main__tabs--drawer-only');
             const rect = list instanceof HTMLElement ? list.getBoundingClientRect() : null;
             if (rect && rect.height > 0 && rect.bottom > 0) {
                 root.style.setProperty('--dt-run-panel-top', `${Math.round(rect.bottom + 8)}px`);
@@ -211,13 +213,14 @@ const AppWrapper = observer(() => {
             }
         };
         update();
-        const interval = setInterval(update, 1000);
+        const listObserver = typeof ResizeObserver !== 'undefined' && list instanceof HTMLElement
+            ? new ResizeObserver(update)
+            : null;
+        if (list instanceof HTMLElement) listObserver?.observe(list);
         window.addEventListener('resize', update);
-        window.addEventListener('scroll', update, true);
         return () => {
-            clearInterval(interval);
+            listObserver?.disconnect();
             window.removeEventListener('resize', update);
-            window.removeEventListener('scroll', update, true);
             root.style.removeProperty('--dt-run-panel-top');
         };
     }, []);
@@ -259,8 +262,8 @@ const AppWrapper = observer(() => {
                     alignItems: 'center',
                     justifyContent: 'center',
                     borderRadius: '7px',
-                    background: 'linear-gradient(135deg, #06b6d4 0%, #6366f1 52%, #ec4899 100%)',
-                    boxShadow: '0 2px 8px rgba(99, 102, 241, 0.32)',
+                    background: 'linear-gradient(135deg, #fef3c7 0%, #fdba74 52%, #fb923c 100%)',
+                    boxShadow: '0 2px 8px rgba(194, 65, 12, 0.26)',
                     flexShrink: 0,
                 }}
             >
@@ -480,7 +483,7 @@ const AppWrapper = observer(() => {
             {/* Keep the mobile experience focused: WhatsApp is a Dashboard
                 affordance on phones, while desktop retains the existing
                 floating contact button on every page. */}
-            {(isDesktop || active_tab === DASHBOARD) && <WhatsAppFloat />}
+            {(isDesktop || active_tab === DASHBOARD) && <WhatsAppFloat hidden />}
 
             <DesktopWrapper>
                 <div className='main__run-strategy-wrapper'>
