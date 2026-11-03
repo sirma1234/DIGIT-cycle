@@ -1,15 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-    api_base,
-    load,
-    save_types,
-} from '@/external/bot-skeleton';
+import { api_base, load, save_types } from '@/external/bot-skeleton';
 import { useDerivTrade, type TickData } from '@/hooks/useDerivTrade';
 import { DBOT_TABS } from '@/constants/bot-contents';
 import { getDisplayCurrency, subscribeCurrency, toUsd } from '@/utils/currency-display';
 import { setTradeContext } from '@/utils/trade-metadata';
 import {
     AUTO_SIGNAL_BOTS,
+    getAutoSignalBot,
     patchAutoSignalsBotXml,
 } from './bot-xml';
 import {
@@ -19,7 +16,21 @@ import {
     setAutoSignalsRunMessage,
     subscribeAutoSignalsRunSession,
 } from './auto-signals-run-session';
-import { evaluateAutoSignal, shouldExcludeAutoSignalMarket } from './auto-signals-engine';
+import {
+    evaluateAutoSignalCandidates,
+    getSuggestedAutoSignalRuns,
+    shouldExcludeAutoSignalMarket,
+} from './auto-signals-engine';
+import {
+    ensureAutoSignalWorkspaceLoaded,
+    isAutoSignalWorkspaceReady,
+    startAutoSignalsBotWithRetry,
+} from './bot-builder-handoff';
+import {
+    isDigitMatchRescanDue,
+    refreshMatchEntryReadiness,
+    startDigitMatchMarketRescan,
+} from './digit-match-rescan';
 import type {
     AutoSignalAction,
     AutoSignalCandidate,
@@ -33,13 +44,14 @@ import type { AutoLabTick } from '@/pages/auto-lab/auto-lab-engine';
 
 const SETTINGS_KEY = 'auto_signals_settings_v1';
 const HISTORY_COUNT = 1000;
+const HISTORY_REQUEST_INTERVAL_MS = 1000;
 const LIVE_TICK_STALE_MS = 8000;
-const MIN_TICK_SIZE = 20;
+const MIN_TICK_SIZE = HISTORY_COUNT;
 
 const DEFAULT_SETTINGS: AutoSignalsSettings = {
-    maxRuns: 1,
-    stake1: 1,
-    stake2: 2,
+    maxRuns: 20,
+    stake1: 1.5,
+    stake2: 1.5,
     takeProfit: 5,
     stopLoss: 10,
     martingale: 2,
@@ -51,10 +63,12 @@ type MarketRuntime = {
     info: MarketInfo;
     rawTicks: Map<number, number>;
     ticks: AutoLabTick[];
+    historyLoaded: boolean;
     pipSize: number | null;
     lastTickAt: number | null;
     feedState: AutoSignalMarket['feedState'];
     candidate: AutoSignalCandidate | null;
+    candidates: AutoSignalCandidate[];
     error?: string;
 };
 
@@ -69,10 +83,19 @@ const readSettings = (): AutoSignalsSettings => {
     try {
         const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
         if (!saved || typeof saved !== 'object') return DEFAULT_SETTINGS;
+        // Migrate the previous built-in 1/2 stake pair once, while preserving
+        // any amounts the user deliberately customized.
+        const hadPreviousDefaultStakes = Number(saved.stake1) === 1 && Number(saved.stake2) === 2;
         return {
-            maxRuns: Math.max(1, Math.min(10, Math.floor(Number(saved.maxRuns) || 1))),
-            stake1: Math.max(0.01, Number(saved.stake1) || DEFAULT_SETTINGS.stake1),
-            stake2: Math.max(0.01, Number(saved.stake2) || DEFAULT_SETTINGS.stake2),
+            // Run count is selected per signal; stored legacy maxRuns values
+            // must not pin every new candidate to the old default of one.
+            maxRuns: 20,
+            stake1: hadPreviousDefaultStakes
+                ? DEFAULT_SETTINGS.stake1
+                : Math.max(0.01, Number(saved.stake1) || DEFAULT_SETTINGS.stake1),
+            stake2: hadPreviousDefaultStakes
+                ? DEFAULT_SETTINGS.stake2
+                : Math.max(0.01, Number(saved.stake2) || DEFAULT_SETTINGS.stake2),
             takeProfit: Math.max(0, Number(saved.takeProfit) || 0),
             stopLoss: Math.max(0, Number(saved.stopLoss) || 0),
             martingale: Math.max(1, Number(saved.martingale) || DEFAULT_SETTINGS.martingale),
@@ -90,22 +113,17 @@ const digitFromQuote = (quote: number, pipSize: number) => {
     return Number.isInteger(digit) && digit >= 0 && digit <= 9 ? digit : null;
 };
 
-const marketSnapshot = (
-    runtime: MarketRuntime,
-    family: AutoSignalFamily,
-    now: number,
-): AutoSignalMarket => {
+const marketSnapshot = (runtime: MarketRuntime, now: number): AutoSignalMarket => {
     const ticks = runtime.ticks;
     const latest = ticks[ticks.length - 1];
     const live = runtime.lastTickAt != null && now - runtime.lastTickAt <= LIVE_TICK_STALE_MS;
-    const expired = runtime.candidate?.expiresAt != null && now >= runtime.candidate.expiresAt;
-    const candidate = runtime.candidate
-        ? expired
-            ? { ...runtime.candidate, state: 'expired' as const, entryReady: false }
-            : !live
-                ? { ...runtime.candidate, state: 'unavailable' as const, entryReady: false }
-                : runtime.candidate
-        : null;
+    const candidates = runtime.candidates.map((item) => {
+        if (item.expiresAt != null && now >= item.expiresAt) {
+            return { ...item, state: 'expired' as const, entryReady: false };
+        }
+        return !live ? { ...item, state: 'unavailable' as const, entryReady: false } : item;
+    });
+    const candidate = candidates.find((item) => item.id === runtime.candidate?.id) ?? candidates[0] ?? null;
     return {
         ...runtime.info,
         tickCount: ticks.length,
@@ -113,23 +131,158 @@ const marketSnapshot = (
         latestQuote: latest?.quote ?? null,
         updatedAt: runtime.lastTickAt,
         feedState: live ? 'live' : runtime.feedState === 'error' ? 'error' : runtime.lastTickAt ? 'stale' : runtime.feedState,
+        historyLoaded: runtime.historyLoaded,
         candidate,
-        availableContractTypes: candidate ? [candidate.contractType] : [],
+        candidates,
+        availableContractTypes: [...new Set(candidates.map((item) => item.contractType))],
         error: runtime.error,
     };
 };
 
-const wait = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+const nextFrame = () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+
+const isLiveBuilderWorkspace = (workspace: any): boolean => {
+    if (!workspace || typeof workspace.getTopBlocks !== 'function') return false;
+    const disposed = typeof workspace.isDisposed === 'function'
+        ? workspace.isDisposed()
+        : workspace.isDisposed;
+    return !disposed;
+};
+
+const rebuildRuntimeTicks = (runtime: MarketRuntime) => {
+    if (!runtime.pipSize) {
+        runtime.ticks = [];
+        return;
+    }
+    const sorted = Array.from(runtime.rawTicks.entries())
+        .sort(([left], [right]) => left - right)
+        .slice(-HISTORY_COUNT);
+    runtime.rawTicks = new Map(sorted);
+    runtime.ticks = sorted.flatMap(([epoch, quote]) => {
+        const digit = digitFromQuote(quote, runtime.pipSize!);
+        return digit == null ? [] : [{
+            symbol: runtime.info.symbol,
+            epoch,
+            quote,
+            digit,
+            pip_size: runtime.pipSize!,
+        }];
+    });
+};
+
+const appendLiveTick = (runtime: MarketRuntime, tick: TickData) => {
+    const previousPipSize = runtime.pipSize;
+    if (Number.isFinite(tick.pip_size) && tick.pip_size > 0) runtime.pipSize = tick.pip_size;
+    if (!runtime.pipSize) return;
+
+    const alreadySeen = runtime.rawTicks.has(tick.epoch);
+    runtime.rawTicks.set(tick.epoch, tick.quote);
+    const digit = digitFromQuote(tick.quote, runtime.pipSize);
+    if (digit == null) return;
+
+    const latestEpoch = runtime.ticks[runtime.ticks.length - 1]?.epoch ?? -Infinity;
+    if (
+        !alreadySeen
+        && tick.epoch > latestEpoch
+        && previousPipSize === runtime.pipSize
+    ) {
+        runtime.ticks.push({
+            symbol: runtime.info.symbol,
+            epoch: tick.epoch,
+            quote: tick.quote,
+            digit,
+            pip_size: runtime.pipSize,
+        });
+        if (runtime.ticks.length > HISTORY_COUNT) {
+            const removed = runtime.ticks.shift();
+            if (removed) runtime.rawTicks.delete(removed.epoch);
+        }
+    } else {
+        rebuildRuntimeTicks(runtime);
+    }
+};
 
 const getBlocklyWorkspace = () => (window as any).Blockly?.derivWorkspace;
 
-const waitForWorkspace = async () => {
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+const waitForBuilderWorkspace = async () => {
+    for (let attempt = 0; attempt < 300; attempt += 1) {
         const workspace = getBlocklyWorkspace();
-        if (workspace) return workspace;
-        await wait(100);
+        if (isLiveBuilderWorkspace(workspace)) return workspace;
+        await nextFrame();
     }
-    throw new Error('Bot Builder workspace did not become ready.');
+    throw new Error('Bot Builder workspace did not become available. Open Bot Builder and try again.');
+};
+
+const isExpectedBotLoaded = (workspace: any, expectedXml: string) => (
+    isAutoSignalWorkspaceReady(workspace, expectedXml)
+    && workspace.getTopBlocks(false).some((block: any) => block.type === 'trade_definition')
+);
+
+const waitForPendingBotLoad = async (expectedXml: string) => {
+    let latestWorkspace: any = null;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+        const workspace = getBlocklyWorkspace();
+        if (isLiveBuilderWorkspace(workspace)) {
+            latestWorkspace = workspace;
+            if (isExpectedBotLoaded(workspace, expectedXml)) return workspace;
+            const hasPreviousBlocks = workspace.getTopBlocks(false).length > 0
+                && workspace.strategy_to_load !== expectedXml;
+            if (
+                hasPreviousBlocks
+                && (window as any).__pendingBotXml !== expectedXml
+            ) {
+                return null;
+            }
+        }
+        await nextFrame();
+    }
+    return isLiveBuilderWorkspace(latestWorkspace) ? latestWorkspace : null;
+};
+
+const loadBotIntoWorkspace = async (
+    expectedXml: string,
+    botName: string,
+    waitForPendingLoad: boolean,
+) => {
+    const workspace = (
+        waitForPendingLoad ? await waitForPendingBotLoad(expectedXml) : null
+    ) || await waitForBuilderWorkspace();
+    const isExpected = () => isExpectedBotLoaded(workspace, expectedXml);
+    if (isExpected()) return workspace;
+
+    await ensureAutoSignalWorkspaceLoaded(workspace, expectedXml, async targetWorkspace => {
+        await load({
+            block_string: expectedXml,
+            drop_event: null,
+            file_name: botName,
+            strategy_id: `auto_signal_${Date.now()}`,
+            from: save_types.LOCAL,
+            workspace: targetWorkspace,
+            showIncompatibleStrategyDialog: false,
+            show_snackbar: false,
+        });
+    });
+
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+        if (isExpected()) return workspace;
+        await nextFrame();
+    }
+    throw new Error('Bot Builder could not load the selected Auto-Signals bot. Try choosing it again.');
+};
+
+const autoSignalTemplateCache = new Map<string, Promise<string>>();
+const loadAutoSignalTemplate = (file: string) => {
+    const cached = autoSignalTemplateCache.get(file);
+    if (cached) return cached;
+    const request = fetch(file).then(async response => {
+        if (!response.ok) throw new Error(`Could not load bot template (${response.status}).`);
+        return response.text();
+    }).catch(error => {
+        autoSignalTemplateCache.delete(file);
+        throw error;
+    });
+    autoSignalTemplateCache.set(file, request);
+    return request;
 };
 
 const accountAmount = (amount: number, currency: string, displayCurrency: string) => {
@@ -138,9 +291,11 @@ const accountAmount = (amount: number, currency: string, displayCurrency: string
 };
 
 export const useAutoSignalsEngine = ({
+    isActive,
     setActiveTab,
     runPanel,
 }: {
+    isActive: boolean;
     setActiveTab: (tab: number) => void;
     runPanel: RunPanelApi;
 }): AutoSignalsPageProps => {
@@ -152,44 +307,92 @@ export const useAutoSignalsEngine = ({
     );
     const [markets, setMarkets] = useState<AutoSignalMarket[]>([]);
     const [family, setFamily] = useState<AutoSignalFamily>('AUTO');
+    const familyRef = useRef<AutoSignalFamily>('AUTO');
     const [settings, setSettings] = useState<AutoSignalsSettings>(readSettings);
     const activeRun = runSession.run;
     const [displayCurrency, setDisplayCurrency] = useState(getDisplayCurrency);
     const [refreshToken, setRefreshToken] = useState(0);
     const runtimesRef = useRef(new Map<string, MarketRuntime>());
     const unsubscribeRef = useRef<Array<() => void>>([]);
+    const releaseScannerFeeds = useCallback(() => {
+        unsubscribeRef.current.splice(0).forEach((unsubscribe) => {
+            try {
+                unsubscribe();
+            } catch (error) {
+                console.warn('[Auto-Signals] Could not release a market tick feed:', error);
+            }
+        });
+    }, []);
     const generationRef = useRef(0);
-    const familyRef = useRef(family);
     const isPreparingRunRef = useRef(false);
-    const flushTimerRef = useRef<number | null>(null);
-    familyRef.current = family;
-
+    const forceScoreRefreshRef = useRef(false);
+    const lastDigitMatchScanAtRef = useRef(0);
+    const flushQueuedRef = useRef(false);
+    const mountedRef = useRef(true);
+    const dirtySymbolsRef = useRef(new Set<string>());
     const queueMarketRefresh = useCallback(() => {
-        if (flushTimerRef.current != null) return;
-        flushTimerRef.current = window.setTimeout(() => {
-            flushTimerRef.current = null;
+        if (flushQueuedRef.current) return;
+        flushQueuedRef.current = true;
+        queueMicrotask(() => {
+            flushQueuedRef.current = false;
+            if (!mountedRef.current) return;
             const now = Date.now();
+            const activeFamily = familyRef.current;
+            const forceScoreRefresh = forceScoreRefreshRef.current;
+            forceScoreRefreshRef.current = false;
+            const shouldScore = activeFamily !== 'MATCHES'
+                || isDigitMatchRescanDue(now, lastDigitMatchScanAtRef.current, forceScoreRefresh);
+            if (activeFamily === 'MATCHES' && shouldScore) {
+                lastDigitMatchScanAtRef.current = now;
+            }
             const snapshot = Array.from(runtimesRef.current.values()).map((runtime) => {
-                if (runtime.ticks.length >= MIN_TICK_SIZE) {
-                    runtime.candidate = evaluateAutoSignal({
-                        market: runtime.info,
-                        ticks: runtime.ticks,
-                        family: familyRef.current,
-                        previous: runtime.candidate,
-                        now,
-                    });
-                } else {
-                    runtime.candidate = null;
+                if (shouldScore && dirtySymbolsRef.current.delete(runtime.info.symbol)) {
+                    runtime.candidates = runtime.ticks.length >= MIN_TICK_SIZE
+                        ? evaluateAutoSignalCandidates({
+                            market: runtime.info,
+                            ticks: runtime.ticks,
+                            family: activeFamily,
+                            previous: runtime.candidate,
+                            now,
+                        })
+                        : [];
+                    runtime.candidate = runtime.candidates[0] ?? null;
                 }
-                return marketSnapshot(runtime, familyRef.current, now);
+                return marketSnapshot(runtime, now);
             });
             setMarkets(snapshot);
-        }, 120);
+        });
+    }, []);
+    const queueFullMarketRefresh = useCallback(() => {
+        forceScoreRefreshRef.current = true;
+        runtimesRef.current.forEach((runtime) => {
+            dirtySymbolsRef.current.add(runtime.info.symbol);
+        });
+        queueMarketRefresh();
+    }, [queueMarketRefresh]);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+        };
     }, []);
 
     useEffect(() => {
         const unsubscribe = subscribeCurrency(() => setDisplayCurrency(getDisplayCurrency()));
         return unsubscribe;
+    }, []);
+
+    useEffect(() => {
+        const filesToWarm = new Set([
+            ...Object.values(AUTO_SIGNAL_BOTS).map((bot) => bot.file),
+            '/bots/auto-signals/normal-killer-bot-v3.xml',
+        ]);
+        // Warm all supported templates during the baseline scan so selecting
+        // Trade Only does not wait for a template request.
+        filesToWarm.forEach(file => {
+            void loadAutoSignalTemplate(file).catch(() => undefined);
+        });
     }, []);
 
     useEffect(() => subscribeAutoSignalsRunSession((nextSession) => {
@@ -211,6 +414,22 @@ export const useAutoSignalsEngine = ({
     }, [queueMarketRefresh]);
 
     useEffect(() => {
+        // Re-score the current authenticated tick windows locally. Live ticks
+        // continue refreshing cards between sweeps, so no extra Deriv history
+        // requests are needed.
+        return startDigitMatchMarketRescan(
+            family === 'MATCHES' && connected && authorized && status === 'scanning',
+            queueFullMarketRefresh,
+        );
+    }, [authorized, connected, family, queueFullMarketRefresh, status]);
+
+    useEffect(() => {
+        if (!isActive) {
+            setStatus('idle');
+            setMessage('Scanner paused outside Auto-Signals. Return to this tab to resume live scanning.');
+            setMarkets([]);
+            return;
+        }
         if (!connected || !authorized) {
             setStatus('idle');
             setMessage(connected
@@ -226,8 +445,7 @@ export const useAutoSignalsEngine = ({
         setMessage('Loading open synthetic markets and attaching authenticated tick feeds…');
 
         const detachFeeds = () => {
-            unsubscribeRef.current.forEach((unsubscribe) => unsubscribe());
-            unsubscribeRef.current = [];
+            releaseScannerFeeds();
             runtimesRef.current.clear();
         };
 
@@ -260,10 +478,12 @@ export const useAutoSignalsEngine = ({
                         info,
                         rawTicks: new Map(),
                         ticks: [],
+                        historyLoaded: false,
                         pipSize: null,
                         lastTickAt: null,
                         feedState: 'loading',
                         candidate: null,
+                        candidates: [],
                     };
                     runtimesRef.current.set(symbol, runtime);
                     return runtime;
@@ -278,43 +498,41 @@ export const useAutoSignalsEngine = ({
                     feedState: 'loading',
                     candidate: null,
                     availableContractTypes: [],
+                    candidates: [],
                 })));
 
                 for (const runtime of runtimes) {
                     const unsubscribe = subscribeTicks(runtime.info.symbol, (tick: TickData) => {
                         if (cancelled || generation !== generationRef.current) return;
                         if (!Number.isFinite(tick.epoch) || !Number.isFinite(tick.quote)) return;
-                        if (Number.isFinite(tick.pip_size) && tick.pip_size > 0) runtime.pipSize = tick.pip_size;
-                        if (!runtime.pipSize) return;
-                        runtime.rawTicks.set(tick.epoch, tick.quote);
-                        const digit = digitFromQuote(tick.quote, runtime.pipSize);
-                        if (digit == null) return;
+                        appendLiveTick(runtime, tick);
+                        if (!runtime.pipSize || !runtime.ticks.length) return;
                         runtime.lastTickAt = Date.now();
                         runtime.feedState = 'live';
                         runtime.error = undefined;
-                        runtime.ticks = Array.from(runtime.rawTicks.entries())
-                            .sort(([left], [right]) => left - right)
-                            .slice(-HISTORY_COUNT)
-                            .flatMap(([epoch, quote]) => {
-                                const historicalDigit = digitFromQuote(quote, runtime.pipSize!);
-                                return historicalDigit == null ? [] : [{
-                                    symbol: runtime.info.symbol,
-                                    epoch,
-                                    quote,
-                                    digit: historicalDigit,
-                                    pip_size: runtime.pipSize!,
-                                }];
-                            });
+                        if (familyRef.current === 'MATCHES') {
+                            const latestDigit = runtime.ticks[runtime.ticks.length - 1]?.digit ?? null;
+                            runtime.candidates = refreshMatchEntryReadiness(
+                                runtime.candidates,
+                                latestDigit,
+                                runtime.lastTickAt,
+                            );
+                            runtime.candidate = runtime.candidates.find(
+                                (candidate) => candidate.id === runtime.candidate?.id,
+                            ) ?? runtime.candidates[0] ?? null;
+                        }
+                        dirtySymbolsRef.current.add(runtime.info.symbol);
                         queueMarketRefresh();
                     });
                     unsubscribeRef.current.push(unsubscribe);
                 }
 
                 setStatus('scanning');
-                setMessage(`Live authenticated scan on ${runtimes.length} open synthetic markets; Jump 100 is excluded.`);
+                setMessage(`Live authenticated scan on ${runtimes.length} open synthetic markets.`);
                 queueMarketRefresh();
 
                 let cursor = 0;
+                let lastHistoryRequestAt = 0;
                 const loadHistoryWorker = async () => {
                     while (!cancelled && generation === generationRef.current) {
                         const index = cursor;
@@ -322,6 +540,14 @@ export const useAutoSignalsEngine = ({
                         if (index >= runtimes.length) return;
                         const runtime = runtimes[index];
                         try {
+                            const waitMs = lastHistoryRequestAt
+                                ? Math.max(0, HISTORY_REQUEST_INTERVAL_MS - (Date.now() - lastHistoryRequestAt))
+                                : 0;
+                            if (waitMs > 0) {
+                                await new Promise<void>((resolve) => window.setTimeout(resolve, waitMs));
+                            }
+                            if (cancelled || generation !== generationRef.current) return;
+                            lastHistoryRequestAt = Date.now();
                             const historyResponse: any = await send({
                                 ticks_history: runtime.info.symbol,
                                 count: HISTORY_COUNT,
@@ -339,34 +565,20 @@ export const useAutoSignalsEngine = ({
                                     runtime.rawTicks.set(epoch, quote);
                                 }
                             }
-                            if (runtime.pipSize) {
-                                runtime.ticks = Array.from(runtime.rawTicks.entries())
-                                    .sort(([left], [right]) => left - right)
-                                    .slice(-HISTORY_COUNT)
-                                    .flatMap(([epoch, quote]) => {
-                                        const digit = digitFromQuote(quote, runtime.pipSize!);
-                                        return digit == null ? [] : [{
-                                            symbol: runtime.info.symbol,
-                                            epoch,
-                                            quote,
-                                            digit,
-                                            pip_size: runtime.pipSize!,
-                                        }];
-                                    });
-                            }
+                            if (runtime.pipSize) rebuildRuntimeTicks(runtime);
+                            runtime.historyLoaded = true;
+                            dirtySymbolsRef.current.add(runtime.info.symbol);
                             queueMarketRefresh();
                         } catch (error: any) {
                             if (cancelled || generation !== generationRef.current) return;
+                            runtime.historyLoaded = true;
                             runtime.error = error?.message || 'Could not load recent tick history.';
                             if (!runtime.lastTickAt) runtime.feedState = 'error';
                             queueMarketRefresh();
                         }
                     }
                 };
-                await Promise.all(Array.from(
-                    { length: Math.min(4, runtimes.length) },
-                    () => loadHistoryWorker(),
-                ));
+                await loadHistoryWorker();
             } catch (error: any) {
                 if (cancelled || generation !== generationRef.current) return;
                 detachFeeds();
@@ -381,18 +593,17 @@ export const useAutoSignalsEngine = ({
             cancelled = true;
             generationRef.current += 1;
             detachFeeds();
-            if (flushTimerRef.current != null) {
-                window.clearTimeout(flushTimerRef.current);
-                flushTimerRef.current = null;
-            }
+            dirtySymbolsRef.current.clear();
+            flushQueuedRef.current = false;
         };
-    }, [authorized, connected, queueMarketRefresh, refreshToken, send, subscribeTicks]);
+    }, [authorized, connected, isActive, queueMarketRefresh, refreshToken, releaseScannerFeeds, send, subscribeTicks]);
 
     const onFamilyChange = useCallback((nextFamily: AutoSignalFamily) => {
         familyRef.current = nextFamily;
+        forceScoreRefreshRef.current = true;
         setFamily(nextFamily);
-        queueMarketRefresh();
-    }, [queueMarketRefresh]);
+        queueFullMarketRefresh();
+    }, [queueFullMarketRefresh]);
 
     const onSettingsChange = useCallback(<K extends keyof AutoSignalsSettings>(
         key: K,
@@ -413,10 +624,18 @@ export const useAutoSignalsEngine = ({
         }
 
         const runtime = runtimesRef.current.get(market.symbol);
-        const candidate = runtime?.candidate;
+        const candidate = market.candidate;
+        const selectedRuns = candidate
+            ? getSuggestedAutoSignalRuns(candidate.recommendedRuns, settings.maxRuns)
+            : 0;
+        if (selectedRuns < 1) {
+            setMessage('This signal is below the minimum run threshold. Wait for a stronger, current signal.');
+            return;
+        }
         const now = Date.now();
         const live = runtime?.lastTickAt != null && now - runtime.lastTickAt <= LIVE_TICK_STALE_MS;
-        if (!runtime || !candidate || candidate.id !== market.candidate?.id || !live
+        const latestCandidate = runtime?.candidates.find((item) => item.id === candidate?.id);
+        if (!runtime || !candidate || !latestCandidate || latestCandidate.id !== candidate.id || !live
             || candidate.expiresAt == null || candidate.expiresAt <= now) {
             setMessage('That signal is no longer current. Wait for the authenticated feed to rescan it.');
             queueMarketRefresh();
@@ -428,12 +647,12 @@ export const useAutoSignalsEngine = ({
         }
 
         isPreparingRunRef.current = true;
-        const bot = AUTO_SIGNAL_BOTS[action];
+        const bot = getAutoSignalBot(action, candidate);
+        let builderHandoffStarted = false;
+        let signalValidatedAt: number | null = null;
         try {
             setMessage(`Preparing ${bot.name} for ${market.label}…`);
-            const response = await fetch(bot.file);
-            if (!response.ok) throw new Error(`Could not load ${bot.name} (${response.status}).`);
-            const template = await response.text();
+            const template = await loadAutoSignalTemplate(bot.file);
             const accountAmounts = {
                 stake1: accountAmount(settings.stake1, currency, displayCurrency),
                 stake2: accountAmount(settings.stake2, currency, displayCurrency),
@@ -444,78 +663,109 @@ export const useAutoSignalsEngine = ({
                 action,
                 market,
                 candidate,
-                settings,
+                // Apply the candidate's signal-selected count to the XML
+                // after-purchase run cap. Bot Builder's Stop control remains
+                // available throughout the run.
+                settings: { ...settings, maxRuns: selectedRuns },
                 accountAmounts,
             });
 
             setTradeContext({ page: 'Auto-Signals', bot: bot.name });
-            (window as any).__pendingBotXml = configuredXml;
-            (window as any).__pendingBotName = bot.name;
+            // Auto-Signals uses one live-tick contract per cycle. Faster mode
+            // removes client-added waits; it must not fan out duplicate orders.
+            const purchasesPerTick = 1;
+            const builderAlreadyMounted = isLiveBuilderWorkspace(getBlocklyWorkspace());
+            const handoffRuntime = runtimesRef.current.get(market.symbol) ?? runtime;
+            const handoffCandidate = handoffRuntime.candidates.find((item) => item.id === candidate.id);
+            signalValidatedAt = Date.now();
+            if (
+                !handoffCandidate
+                || !handoffRuntime.lastTickAt
+                || signalValidatedAt - handoffRuntime.lastTickAt > LIVE_TICK_STALE_MS
+                || handoffCandidate.expiresAt == null
+                || handoffCandidate.expiresAt <= signalValidatedAt
+            ) {
+                throw new Error('The signal is no longer live. Wait for the authenticated feed to rescan it.');
+            }
+            // Release Auto-Signals' multi-market streams before Bot Builder
+            // opens its own tick and contract subscriptions.
+            // Invalidate in-flight history workers as well as live subscriptions.
+            // Unsubscribing alone leaves the scanner's queued ticks_history
+            // requests running after the user switches to Bot Builder.
+            generationRef.current += 1;
+            releaseScannerFeeds();
+            if (!builderAlreadyMounted) {
+                (window as any).__pendingBotXml = configuredXml;
+                (window as any).__pendingBotName = bot.name;
+            }
+            builderHandoffStarted = true;
             setActiveTab(DBOT_TABS.BOT_BUILDER);
             runPanel.toggleDrawer?.(true);
-            const workspace = await waitForWorkspace();
-            if (runPanel.is_running) throw new Error('Stop the currently running Bot Builder bot before loading another.');
-            await load({
-                block_string: configuredXml,
-                drop_event: null,
-                file_name: bot.name,
-                strategy_id: `auto-signals-${action}`,
-                from: save_types.LOCAL,
-                workspace,
-                showIncompatibleStrategyDialog: false,
-                show_snackbar: false,
-            });
-            workspace.strategy_to_load = configuredXml;
-            setActiveTab(DBOT_TABS.BOT_BUILDER);
-
-            const latestRuntime = runtimesRef.current.get(market.symbol);
-            const latestCandidate = latestRuntime?.candidate;
-            const latestTickIsLive = latestRuntime?.lastTickAt != null
-                && Date.now() - latestRuntime.lastTickAt <= LIVE_TICK_STALE_MS;
-            if (!latestCandidate || latestCandidate.id !== candidate.id || !latestTickIsLive
-                || latestCandidate.expiresAt == null || latestCandidate.expiresAt <= Date.now()) {
-                throw new Error('The signal changed while the bot was loading. Return to Auto-Signals and choose the latest signal.');
+            // The pending values cover a workspace that is still mounting.
+            // If Bot Builder is already mounted, use its official loader now;
+            // changing only strategy_to_load would leave its old blocks active.
+            await loadBotIntoWorkspace(
+                configuredXml,
+                bot.name,
+                !builderAlreadyMounted,
+            );
+            if ((window as any).__pendingBotXml === configuredXml) {
+                (window as any).__pendingBotXml = null;
+                (window as any).__pendingBotName = null;
             }
+            if (runPanel.is_running) throw new Error('Stop the currently running Bot Builder bot before loading another.');
+
+            // The bot is now loaded in Bot Builder, so it runs. The signal was validated live just before the
+            // handoff; it is deliberately NOT re-checked here. Switching tabs can unmount this page and clear its
+            // scanner state, which made a good load fail right before Run. The user chose this bot: start it.
 
             const nextRun: AutoSignalsRun = {
                 symbol: market.symbol,
                 action,
                 strategy: candidate.strategy,
                 startedAt: Date.now(),
-                maxRuns: settings.maxRuns,
+                maxRuns: selectedRuns,
                 completedRuns: 0,
+                purchasesPerTick,
             };
             beginAutoSignalsRun(
                 nextRun,
-                () => runPanel.onStopButtonClick?.(),
-                `${bot.name} is starting on ${market.symbol} in Bot Builder.`,
+                `${bot.name} is starting on ${market.symbol} for ${selectedRuns} validated signal cycles, with one purchase per eligible tick.`,
             );
 
-            if (!runPanel.onRunButtonClick) throw new Error('Bot Builder Run control is unavailable.');
-            const startAttempt = runPanel.onRunButtonClick();
-            // RunPanel sets is_running synchronously when shouldRunBot() accepts
-            // the workspace. Capture that before awaiting: a one-tick contract
-            // can settle and stop the bot before the promise continuation runs.
-            const startedSynchronously = Boolean(runPanel.is_running);
-            await startAttempt;
-            if (!startedSynchronously && !runPanel.is_running) {
-                throw new Error('Bot Builder did not start this bot. Check the selected account and bot trade settings.');
-            }
+            // Automatically start after the selected XML is ready. Keep the
+            // app-level Builder active so the loaded workspace and run panel
+            // remain available while this session runs.
+            await startAutoSignalsBotWithRetry(runPanel, (error: any) => {
+                    const startError = error?.message || 'Bot Builder could not start this bot.';
+                    clearAutoSignalsRun(startError);
+                    setAutoSignalsRunMessage(startError);
+            });
             const currentSession = getAutoSignalsRunSession();
             if (currentSession.run?.startedAt === nextRun.startedAt) {
                 const runMessage = action === 'entry-trade' && !candidate.entryReady
-                    ? `${bot.name} is watching for its entry condition on ${market.symbol}.`
-                    : `${bot.name} is trading ${market.symbol} with one-tick contracts.`;
-                setMessage(runMessage);
+                    ? `${bot.name} is watching for its entry condition on ${market.symbol}; it will stop after ${selectedRuns} cycles.`
+                    : `${bot.name} is trading ${market.symbol} for up to ${selectedRuns} validated cycles, one purchase per eligible tick.`;
                 setAutoSignalsRunMessage(runMessage);
             } else {
-                setMessage(currentSession.message || `${bot.name} started on ${market.symbol}.`);
+                setAutoSignalsRunMessage(currentSession.message || `${bot.name} started on ${market.symbol}.`);
             }
         } catch (error: any) {
             const errorMessage = error?.message || 'The Bot Builder handoff failed.';
+            if ((window as any).__pendingBotName === bot.name) {
+                (window as any).__pendingBotXml = null;
+                (window as any).__pendingBotName = null;
+            }
             clearAutoSignalsRun(errorMessage);
+            setAutoSignalsRunMessage(errorMessage);
             setMessage(errorMessage);
-            setActiveTab(DBOT_TABS.AUTO_SIGNALS);
+            // Once XML has been handed to Builder, keep that workspace visible
+            // on both success and failure so the user can inspect the bot and
+            // its Summary/Transactions/Journal panel.
+            if (builderHandoffStarted) {
+                setActiveTab(DBOT_TABS.BOT_BUILDER);
+                runPanel.toggleDrawer?.(true);
+            }
         } finally {
             isPreparingRunRef.current = false;
         }
@@ -523,7 +773,9 @@ export const useAutoSignalsEngine = ({
         authorized,
         currency,
         displayCurrency,
+        isActive,
         queueMarketRefresh,
+        releaseScannerFeeds,
         runPanel,
         setActiveTab,
         settings,

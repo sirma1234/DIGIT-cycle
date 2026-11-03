@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xml xmlns="https://developers.google.com/blockly/xml" is_dbot="true" collection="false">
+  <variables>
+    <variable id="nkv3_stake">stake</variable>
+    <variable id="nkv3_base_stake">base_stake</variable>
+    <variable id="nkv3_martingale">martingale</variable>
+    <variable id="nkv3_take_profit">take_profit</variable>
+    <variable id="nkv3_stop_loss">stop_loss</variable>
+  </variables>
+  <block type="trade_definition" id="nkv3_definition" deletable="false" x="0" y="0">
+    <statement name="TRADE_OPTIONS">
+      <block type="trade_definition_market" id="nkv3_market" deletable="false" movable="false">
+        <field name="MARKET_LIST">synthetic_index</field>
+        <field name="SUBMARKET_LIST">random_index</field>
+        <field name="SYMBOL_LIST">1HZ15V</field>
+        <field name="ALTERNATE_MARKETS">TRUE</field>
+        <field name="ALTERNATE_MODE">EVERY_X_RUNS</field>
+        <field name="ALTERNATE_EVERY">1</field>
+        <next>
+          <block type="trade_definition_tradetype" id="nkv3_trade_type" deletable="false" movable="false">
+            <field name="TRADETYPECAT_LIST">digits</field>
+            <field name="TRADETYPE_LIST">overunder</field>
+            <next>
+              <block type="trade_definition_contracttype" id="nkv3_contract_type" deletable="false" movable="false">
+                <field name="TYPE_LIST">both</field>
+                <next>
+                  <block type="trade_definition_candleinterval" id="nkv3_candle_interval" deletable="false" movable="false">
+                    <field name="CANDLEINTERVAL_LIST">60</field>
+                    <next>
+                      <block type="trade_definition_restartbuysell" id="nkv3_restart_buy_sell" deletable="false" movable="false">
+                        <field name="TIME_MACHINE_ENABLED">FALSE</field>
+                        <next>
+                          <block type="trade_definition_restartonerror" id="nkv3_restart_on_error" deletable="false" movable="false">
+                            <field name="RESTARTONERROR">TRUE</field>
+                          </block>
+                        </next>
+                      </block>
+                    </next>
+                  </block>
+                </next>
+              </block>
+            </next>
+          </block>
+        </next>
+      </block>
+    </statement>
+    <statement name="INITIALIZATION">
+      <block type="variables_set" id="nkv3_init_stake">
+        <field name="VAR" id="nkv3_stake">stake</field>
+        <value name="VALUE"><block type="math_number"><field name="NUM">0.35</field></block></value>
+        <next>
+          <block type="variables_set" id="nkv3_init_base_stake">
+            <field name="VAR" id="nkv3_base_stake">base_stake</field>
+            <value name="VALUE"><block type="math_number"><field name="NUM">0.35</field></block></value>
+            <next>
+              <block type="variables_set" id="nkv3_init_martingale">
+                <field name="VAR" id="nkv3_martingale">martingale</field>
+                <value name="VALUE"><block type="math_number"><field name="NUM">2</field></block></value>
+                <next>
+                  <block type="variables_set" id="nkv3_init_take_profit">
+                    <field name="VAR" id="nkv3_take_profit">take_profit</field>
+                    <value name="VALUE"><block type="math_number"><field name="NUM">5</field></block></value>
+                    <next>
+                      <block type="variables_set" id="nkv3_init_stop_loss">
+                        <field name="VAR" id="nkv3_stop_loss">stop_loss</field>
+                        <value name="VALUE"><block type="math_number"><field name="NUM">15</field></block></value>
+                      </block>
+                    </next>
+                  </block>
+                </next>
+              </block>
+            </next>
+          </block>
+        </next>
+      </block>
+    </statement>
+    <statement name="SUBMARKET">
+      <block type="trade_definition_tradeoptions" id="nkv3_trade_options">
+        <mutation has_first_barrier="false" has_second_barrier="false" has_prediction="true"/>
+        <field name="DURATIONTYPE_LIST">t</field>
+        <value name="DURATION">
+          <shadow type="math_number_positive"><field name="NUM">1</field></shadow>
+        </value>
+        <value name="AMOUNT">
+          <block type="variables_get" id="nkv3_stake_amount">
+            <field name="VAR" id="nkv3_stake">stake</field>
+          </block>
+        </value>
+        <value name="PREDICTION">
+          <shadow type="math_number_positive"><field name="NUM">1</field></shadow>
+        </value>
+      </block>
+    </statement>
+  </block>
+  <block type="before_purchase" id="nkv3_before" deletable="false" x="0" y="760">
+    <data>nkv3-pipeline</data>
+    <statement name="BEFOREPURCHASE_STACK">
+      <block type="normal_killer_tick_acceleration" id="nkv3_tick_acceleration_main">
+        <data>nkv3-tick-acceleration</data>
+        <next>
+          <block type="purchase" id="nkv3_purchase">
+            <field name="PURCHASE_LIST">DIGITOVER</field>
+          </block>
+        </next>
+      </block>
+    </statement>
+  </block>
+  <block type="during_purchase" id="nkv3_during" deletable="false" x="0" y="1040">
+    <statement name="DURINGPURCHASE_STACK">
+      <block type="normal_killer_tick_acceleration" id="nkv3_tick_acceleration_during">
+        <data>nkv3-tick-acceleration</data>
+      </block>
+    </statement>
+  </block>
+  <block type="after_purchase" id="nkv3_after" deletable="false" x="850" y="0">
+    <statement name="AFTERPURCHASE_STACK">
+      <block type="controls_if" id="nkv3_restart_martingale">
+        <mutation else="1" />
+        <value name="IF0">
+          <block type="contract_check_result" id="nkv3_result_win">
+            <field name="CHECK_RESULT">win</field>
+          </block>
+        </value>
+        <statement name="DO0">
+          <block type="variables_set" id="nkv3_reset_stake">
+            <field name="VAR" id="nkv3_stake">stake</field>
+            <value name="VALUE">
+              <block type="variables_get" id="nkv3_base_stake_win">
+                <field name="VAR" id="nkv3_base_stake">base_stake</field>
+              </block>
+            </value>
+          </block>
+        </statement>
+        <statement name="ELSE">
+          <block type="variables_set" id="nkv3_loss_stake">
+            <field name="VAR" id="nkv3_stake">stake</field>
+            <value name="VALUE">
+              <block type="math_arithmetic" id="nkv3_stake_product">
+                <field name="OP">MULTIPLY</field>
+                <value name="A">
+                  <block type="variables_get" id="nkv3_current_stake">
+                    <field name="VAR" id="nkv3_stake">stake</field>
+                  </block>
+                </value>
+                <value name="B">
+                  <block type="variables_get" id="nkv3_martingale_factor">
+                    <field name="VAR" id="nkv3_martingale">martingale</field>
+                  </block>
+                </value>
+              </block>
+            </value>
+          </block>
+        </statement>
+        <next>
+          <block type="trade_again" id="nkv3_trade_again"/>
+        </next>
+      </block>
+    </statement>
+  </block>
+</xml>

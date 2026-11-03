@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     Activity,
     ArrowDownRight,
@@ -12,7 +12,13 @@ import {
     TrendingUp,
     Wifi,
     WifiOff,
+    Zap,
 } from 'lucide-react';
+import {
+    isASpeedBoostEnabled,
+    setASpeedBoostEnabled,
+    subscribeASpeedBoost,
+} from '@/utils/execution-speed';
 import type {
     AutoSignalAction,
     AutoSignalCandidate,
@@ -22,6 +28,7 @@ import type {
     AutoSignalsSettings,
 } from './types';
 import NumberField from '@/components/number-field';
+import { getSuggestedAutoSignalRuns } from './auto-signals-engine';
 import './auto-signals.scss';
 
 const FAMILY_OPTIONS: { value: AutoSignalFamily; label: string; short: string }[] = [
@@ -56,7 +63,6 @@ const SETTINGS_FIELDS: {
     step: number;
     prefix?: string;
 }[] = [
-    { key: 'maxRuns', label: 'Runs', hint: '1–10 maximum', min: 1, max: 10, step: 1 },
     { key: 'stake1', label: 'Stake 01', hint: 'Initial amount', min: 0.01, step: 0.01 },
     { key: 'stake2', label: 'Stake 02', hint: 'Second amount', min: 0.01, step: 0.01 },
     { key: 'takeProfit', label: 'Take profit', hint: 'Stop at this gain', min: 0, step: 0.01 },
@@ -99,16 +105,44 @@ const stateLabel: Record<AutoSignalCandidate['state'], string> = {
     expired: 'EXPIRED',
 };
 
-function getFamily(market: AutoSignalMarket): AutoSignalFamily {
-    return market.candidate ? STRATEGY_FAMILY[market.candidate.strategy] || 'AUTO' : 'AUTO';
+function getFamily(candidate: AutoSignalCandidate): AutoSignalFamily {
+    return STRATEGY_FAMILY[candidate.strategy] || 'AUTO';
 }
 
-function WindowConfidence({ market }: { market: AutoSignalMarket }) {
-    const windows = market.candidate?.windows ?? [];
+type VisibleSignalCard = {
+    key: string;
+    market: AutoSignalMarket;
+    candidate: AutoSignalCandidate | null;
+};
+
+const tradeOnlyTone = (candidate: AutoSignalCandidate | null) => {
+    if (candidate?.strategy === 'UNDER' && (candidate.barrier === 4 || candidate.barrier === 5)) {
+        return 'pink';
+    }
+    if (candidate?.strategy === 'OVER' && candidate.barrier != null && candidate.barrier >= 1 && candidate.barrier <= 3) {
+        return 'burgundy';
+    }
+    if (candidate?.strategy === 'UNDER' && candidate.barrier != null && candidate.barrier >= 6 && candidate.barrier <= 8) {
+        return 'blue';
+    }
+    if (candidate?.strategy === 'UNDER' && candidate.barrier != null && candidate.barrier >= 1 && candidate.barrier <= 3) {
+        return 'yellow';
+    }
+    if (candidate?.strategy === 'OVER' && candidate.barrier != null && candidate.barrier >= 4 && candidate.barrier <= 5) {
+        return 'green';
+    }
+    if (candidate?.strategy === 'OVER' && candidate.barrier != null && candidate.barrier >= 6 && candidate.barrier <= 8) {
+        return 'red';
+    }
+    return 'default';
+};
+
+function WindowConfidence({ candidate, symbol }: { candidate: AutoSignalCandidate | null; symbol: string }) {
+    const windows = candidate?.windows ?? [];
 
     if (!windows.length) {
         return (
-            <div className='as-window-empty' data-testid={`text-window-state-${market.symbol}`}>
+            <div className='as-window-empty' data-testid={`text-window-state-${symbol}`}>
                 Window confirmation will appear as ticks arrive.
             </div>
         );
@@ -117,7 +151,13 @@ function WindowConfidence({ market }: { market: AutoSignalMarket }) {
     return (
         <div className='as-windows' aria-label='Historical one-tick outcome windows, not future win probabilities'>
             {windows.map((item) => (
-                <div className={`as-window ${item.agrees ? 'is-agree' : 'is-diverge'}`} key={item.window}>
+                    <div
+                        className={`as-window ${item.agrees ? 'is-agree' : 'is-diverge'} ${item.window === 20 ? 'as-window--recent' : ''}`}
+                        key={item.window}
+                        title={item.window === 20
+                            ? `Observed rate across the latest 20 ticks (${item.sampleSize} one-tick outcomes); not a prediction.`
+                            : `${item.sampleSize} historical one-tick outcomes.`}
+                    >
                     <div className='as-window__top'>
                         <span>{item.window}T</span>
                         {item.agrees ? <Check size={12} aria-hidden='true' /> : <span className='as-window__dash'>–</span>}
@@ -135,52 +175,117 @@ function WindowConfidence({ market }: { market: AutoSignalMarket }) {
 
 function MarketCard({
     market,
+    candidate,
     now,
     currency,
+    settings,
     onTrade,
 }: {
     market: AutoSignalMarket;
+    candidate: AutoSignalCandidate | null;
     now: number;
     currency: string;
+    settings: AutoSignalsSettings;
     onTrade: AutoSignalsPageProps['onTrade'];
 }) {
-    const candidate = market.candidate;
     const [pendingAction, setPendingAction] = useState<AutoSignalAction | null>(null);
+    const [showTradeChoices, setShowTradeChoices] = useState(false);
+    const [runCountOverride, setRunCountOverride] = useState<number | null>(null);
     const score = Math.max(0, Math.min(100, candidate?.score ?? 0));
+    const noSignalReason = market.error
+        || (market.tickCount < 1000
+            ? `Loading the 1,000-tick baseline (${market.tickCount.toLocaleString()}/1,000 ticks).`
+            : 'No signal passed the full-history confidence and multi-window checks.');
+    const selectedRuns = candidate
+        ? getSuggestedAutoSignalRuns(runCountOverride ?? candidate.recommendedRuns, settings.maxRuns)
+        : 0;
     const isLive = market.feedState === 'live';
     const canTrade = Boolean(
         candidate
+        && candidate.recommendedRuns > 0
         && candidate.state !== 'expired'
         && candidate.state !== 'unavailable'
         && isLive,
     );
     const directionUp = ['RISE', 'ONLY_UPS'].includes(candidate?.strategy ?? '');
     const signalTone = candidate?.tier === 'ELITE' || candidate?.tier === 'STRONG' ? 'strong' : 'steady';
+
+    useEffect(() => {
+        setRunCountOverride(null);
+    }, [candidate?.id]);
+
     const startTrade = async (action: AutoSignalAction) => {
         if (pendingAction) return;
         setPendingAction(action);
+        setShowTradeChoices(false);
         try {
-            await onTrade(market, action);
+            const tradeCandidate = candidate
+                ? { ...candidate, recommendedRuns: selectedRuns }
+                : null;
+            await onTrade(
+                tradeCandidate ? { ...market, candidate: tradeCandidate } : market,
+                action,
+            );
         } finally {
             setPendingAction(null);
         }
     };
+    const cardId = candidate
+        ? `${market.symbol}-${candidate.strategy}-${candidate.barrier ?? 'none'}`
+        : market.symbol;
+    const tradeOnlyDescription = candidate?.strategy === 'MATCHES'
+        ? 'Load Ahmed SYN Even/Odd Market Killer v1.2 and run it automatically'
+        : 'Load the bot matched to this signal and run it automatically';
+    const tradeTone = tradeOnlyTone(candidate);
+    const openTradeChoices = () => {
+        if (!canTrade || pendingAction) return;
+        setShowTradeChoices((open) => !open);
+    };
 
     return (
-        <article className={`as-market-card as-market-card--${candidate?.state ?? 'no-signal'}`} data-testid={`card-market-${market.symbol}`}>
+        <article
+            className={`as-market-card as-market-card--${candidate?.state ?? 'no-signal'} as-market-card--tone-${tradeTone}`}
+            data-testid={`card-market-${cardId}`}
+        >
+            <div className='as-card-run-control' data-testid={`run-count-control-${cardId}`}>
+                <label htmlFor={`input-suggested-runs-${cardId}`}>SUGGESTED RUNS</label>
+                <NumberField
+                    id={`input-suggested-runs-${cardId}`}
+                    className='as-card-run-control__input'
+                    min={1}
+                    max={settings.maxRuns}
+                    step={1}
+                    value={selectedRuns}
+                    disabled={!candidate || candidate.recommendedRuns < 1}
+                    onCommit={(next) => setRunCountOverride(
+                        Math.max(1, Math.min(settings.maxRuns, Math.round(next))),
+                    )}
+                    aria-label={`Suggested runs for ${market.label}`}
+                    data-testid={`input-suggested-runs-${cardId}`}
+                />
+            </div>
             <div className='as-market-card__head'>
                 <div className='as-market-card__identity'>
-                    <span className={`as-market-card__feed ${isLive ? 'is-live' : `is-${market.feedState}`}`} data-testid={`status-feed-${market.symbol}`}>
+                    <span className={`as-market-card__feed ${isLive ? 'is-live' : `is-${market.feedState}`}`} data-testid={`status-feed-${cardId}`}>
                         <i />
                         {feedLabel[market.feedState]}
                     </span>
-                    <h3 data-testid={`text-market-label-${market.symbol}`}>{market.label}</h3>
+                    <h3 data-testid={`text-market-label-${cardId}`}>{market.label}</h3>
                     <span className='as-market-card__marketline'>{market.market} <b>/</b> {market.submarket}</span>
                 </div>
                 <div className='as-market-card__quote'>
+                    <div
+                        className='as-market-card__confidence'
+                        data-testid={`text-confidence-${cardId}`}
+                        title='Historical alignment score from validated tick windows. It is not a calibrated win probability.'
+                    >
+                        <span>SIGNAL CONFIDENCE</span>
+                        <strong>{candidate ? `${Math.round(score)}%` : '—'}</strong>
+                        <small>{candidate ? 'Historical alignment · not a forecast' : 'No active signal'}</small>
+                    </div>
                     <span>LAST QUOTE</span>
-                    <strong data-testid={`text-quote-${market.symbol}`}>{numberText(market.latestQuote, 3)}</strong>
-                    <small>digit <b data-testid={`text-digit-${market.symbol}`}>{market.latestDigit ?? '—'}</b></small>
+                    <strong data-testid={`text-quote-${cardId}`}>{numberText(market.latestQuote, 3)}</strong>
+                    <small>digit <b data-testid={`text-digit-${cardId}`}>{market.latestDigit ?? '—'}</b></small>
                 </div>
             </div>
 
@@ -189,7 +294,7 @@ function MarketCard({
                     <span className='as-overline'>CURRENT READ</span>
                     {candidate ? (
                         <>
-                            <strong data-testid={`text-signal-${market.symbol}`}>
+                            <strong data-testid={`text-signal-${cardId}`}>
                                 {candidate.label}
                                 {candidate.barrier != null && <em> {candidate.barrier}</em>}
                             </strong>
@@ -198,70 +303,110 @@ function MarketCard({
                     ) : (
                         <>
                             <strong className='as-signal-strip__idle'>No active setup</strong>
-                            <small>{market.error || 'Waiting for multi-window alignment'}</small>
+                            <small>{noSignalReason}</small>
                         </>
                     )}
                 </div>
-                <div className={`as-signal-state as-signal-state--${candidate?.state ?? 'no-signal'}`} data-testid={`status-signal-${market.symbol}`}>
+                <div className={`as-signal-state as-signal-state--${candidate?.state ?? 'no-signal'}`} data-testid={`status-signal-${cardId}`}>
                     {candidate ? stateLabel[candidate.state] : 'NO SIGNAL'}
                 </div>
             </div>
 
-            <div className='as-score-line' title='Alignment score is a historical pattern score, not a predicted win probability.'>
-                <div className='as-score-line__label'>
-                    <span>ALIGNMENT SCORE</span>
-                    <strong
-                        title='Composite score from historical tick-window alignment; it is not a win probability.'
-                        data-testid={`text-score-${market.symbol}`}
-                    >
-                        {candidate ? `${Math.round(score)}/100` : '—'}
-                    </strong>
-                </div>
-                <div className='as-score-track'><i style={{ width: `${score}%` }} /></div>
-                <span className='as-score-line__tier'>{candidate?.tier ?? 'SCANNING'}</span>
-            </div>
-
-            <div className={`as-entry-state ${candidate?.entryReady ? 'is-ready' : ''}`} data-testid={`status-entry-${market.symbol}`}>
-                <span>ENTRY CONDITION</span>
-                <strong>{candidate ? (candidate.entryReady ? 'CONFIRMED' : 'WAITING') : 'NO SETUP'}</strong>
-                <small>
-                    {candidate?.entryDigit != null
-                        ? `Digit ${candidate.entryDigit}`
-                        : candidate && ['RISE', 'FALL', 'ONLY_UPS', 'ONLY_DOWNS'].includes(candidate.strategy)
-                            ? 'Price direction'
-                            : 'Entry digit —'}
-                </small>
-            </div>
-
-            <WindowConfidence market={market} />
-
-            <div className='as-market-card__reason' data-testid={`text-reason-${market.symbol}`}>
-                <span className='as-reason-mark'><Activity size={13} aria-hidden='true' /></span>
-                <p>{candidate?.reason || 'No candidate has cleared the confirmation windows yet.'}</p>
-            </div>
-
             <div className='as-market-card__meta'>
                 <span><Clock3 size={12} aria-hidden='true' /> {candidate?.createdAt ? clockText(candidate.createdAt) : 'No signal time'}</span>
-                <span className='as-expiry' data-testid={`text-expiry-${market.symbol}`}>
+                <span className='as-expiry' data-testid={`text-expiry-${cardId}`}>
                     Expires in <b>{remainingText(candidate?.expiresAt, now)}</b>
                 </span>
             </div>
-            <div className='as-revalidation'>
-                <span className='as-revalidation__pulse' />
-                <span>Signal valid for 5m · 1-tick contract · checked on each tick</span>
-                <small>Updated {clockText(market.updatedAt)}</small>
-            </div>
+
+            <details className='as-card-analysis'>
+                <summary className='as-card-analysis__summary' aria-label={`Show signal analysis for ${market.label}`}>
+                    <span>Signal analysis</span>
+                    <strong>
+                        {candidate
+                            ? `${selectedRuns} suggested cycles · ${Math.round(score)}/100`
+                            : 'Waiting for a signal'}
+                    </strong>
+                </summary>
+                <div className='as-card-analysis__body'>
+                    <div className='as-score-line' title='Alignment score is a historical pattern score, not a predicted win probability.'>
+                        <div className='as-score-line__label'>
+                            <span>ALIGNMENT SCORE</span>
+                            <strong
+                                title='Composite score from historical tick-window alignment; it is not a win probability.'
+                                data-testid={`text-score-${cardId}`}
+                            >
+                                {candidate ? `${Math.round(score)}/100` : '—'}
+                            </strong>
+                        </div>
+                        <div className='as-score-track'><i style={{ width: `${score}%` }} /></div>
+                        <span className='as-score-line__tier'>{candidate?.tier ?? 'SCANNING'}</span>
+                    </div>
+
+                    <div className='as-run-recommendation' data-testid={`text-run-recommendation-${cardId}`}>
+                        <span>Signal cycles</span>
+                        <strong>{candidate ? selectedRuns : 0}</strong>
+                        <small>
+                            Tick-driven execution sends one contract per cycle, with no added wait after settlement.
+                            Actual speed depends on the next Deriv tick and the API response. The cycle cap,
+                            take-profit, and stop-loss limits still apply.
+                        </small>
+                    </div>
+
+                    <div className={`as-entry-state ${candidate?.entryReady ? 'is-ready' : ''}`} data-testid={`status-entry-${cardId}`}>
+                        <span>ENTRY CONDITION</span>
+                        <strong>{candidate ? (candidate.entryReady ? 'CONFIRMED' : 'WAITING') : 'NO SETUP'}</strong>
+                        <small>
+                            {candidate?.strategy === 'MATCHES' && candidate.entryDigit != null
+                                ? `Entry ${candidate.entryDigit} → target ${candidate.barrier}`
+                                : candidate?.entryDigit != null
+                                ? `Digit ${candidate.entryDigit}`
+                        : candidate?.strategy === 'RISE'
+                            ? '2 falls; 2 falls then 1 rise; or 3 falls'
+                            : candidate?.strategy === 'FALL'
+                                ? '3/4 rises then 1 fall; or 5 rises'
+                                : candidate && ['ONLY_UPS', 'ONLY_DOWNS'].includes(candidate.strategy)
+                                    ? '1-tick price direction'
+                                    : 'Entry digit —'}
+                        </small>
+                    </div>
+
+                    <WindowConfidence candidate={candidate} symbol={cardId} />
+
+                    <div className='as-market-card__reason' data-testid={`text-reason-${cardId}`}>
+                        <span className='as-reason-mark'><Activity size={13} aria-hidden='true' /></span>
+                        <p>{candidate?.reason || 'No candidate has cleared the confirmation windows yet.'}</p>
+                    </div>
+
+                    <div className='as-revalidation'>
+                        <span className='as-revalidation__pulse' />
+                        <span>Signal valid for 5m · 1-tick contract · checked on each tick</span>
+                        <small>Updated {clockText(market.updatedAt)}</small>
+                    </div>
+                    {candidate && !candidate.entryReady && (
+                        <p className='as-entry-note' data-testid={`text-entry-wait-${cardId}`}>
+                            {candidate.strategy === 'MATCHES'
+                                ? `Trade Only waits for entry digit ${candidate.entryDigit}; it buys Matches target ${candidate.barrier} and stops after ${selectedRuns} cycles.`
+                                : 'Entry Trade starts the bot now; it waits for its configured entry condition before buying.'}
+                        </p>
+                    )}
+                    {!candidate && <p className='as-entry-note'>Trade handoff is available when a signal is active.</p>}
+                </div>
+            </details>
 
             <div className='as-market-card__actions'>
                 <button
-                    className='as-button as-button--quiet'
+                    className={`as-button as-button--quiet as-button--trade-only-${tradeTone}`}
                     type='button'
                     disabled={!canTrade || pendingAction !== null}
-                    aria-busy={pendingAction === 'trade-only'}
-                    onClick={() => void startTrade('trade-only')}
-                    data-testid={`button-trade-only-${market.symbol}`}
+                    aria-busy={pendingAction === 'trade-only' || pendingAction === 'over-dt' || pendingAction === 'under-dt'}
+                    aria-expanded={showTradeChoices}
+                    onClick={openTradeChoices}
+                    data-testid={`button-trade-only-${cardId}`}
                 >
-                    {pendingAction === 'trade-only' ? 'Loading bot…' : 'Trade Only'}
+                    {pendingAction === 'trade-only' || pendingAction === 'over-dt' || pendingAction === 'under-dt'
+                        ? 'Loading bot…'
+                        : 'Trade Only'}
                 </button>
                 <button
                     className='as-button as-button--primary'
@@ -269,16 +414,43 @@ function MarketCard({
                     disabled={!canTrade || pendingAction !== null}
                     aria-busy={pendingAction === 'entry-trade'}
                     onClick={() => void startTrade('entry-trade')}
-                    data-testid={`button-entry-trade-${market.symbol}`}
+                    data-testid={`button-entry-trade-${cardId}`}
                 >
                     {directionUp ? <ArrowUpRight size={15} aria-hidden='true' /> : <ArrowDownRight size={15} aria-hidden='true' />}
                     {pendingAction === 'entry-trade' ? 'Loading bot…' : 'Entry Trade'}
                 </button>
             </div>
-            {candidate && !candidate.entryReady && (
-                <p className='as-entry-note' data-testid={`text-entry-wait-${market.symbol}`}>Entry Trade starts the bot now; it waits for its configured entry condition before buying.</p>
+            {showTradeChoices && candidate && (
+                <div className='as-trade-choice' role='dialog' aria-label={`Choose a ${candidate.label} bot for ${market.label}`}>
+                    <strong>Choose a bot for this signal</strong>
+                    <button
+                        className={`as-trade-choice__trade-only as-button--trade-only-${tradeTone}`}
+                        type='button'
+                        onClick={() => void startTrade('trade-only')}
+                    >
+                        Trade Only <small>{tradeOnlyDescription}</small>
+                    </button>
+                    {candidate.strategy === 'OVER' && (
+                        <button
+                            className={`as-trade-choice__dt as-trade-choice__dt--${tradeTone}`}
+                            type='button'
+                            onClick={() => void startTrade('over-dt')}
+                        >
+                            Over DT <small>Use Ahmed OVER DT Oppo Killer</small>
+                        </button>
+                    )}
+                    {candidate.strategy === 'UNDER' && (
+                        <button
+                            className={`as-trade-choice__dt as-trade-choice__dt--${tradeTone}`}
+                            type='button'
+                            onClick={() => void startTrade('under-dt')}
+                        >
+                            Under DT <small>Use Ahmed UNDER DT Oppo Killer</small>
+                        </button>
+                    )}
+                    <button className='as-trade-choice__cancel' type='button' onClick={() => setShowTradeChoices(false)}>Cancel</button>
+                </div>
             )}
-            {!candidate && <p className='as-entry-note'>Trade handoff is available when a signal is active.</p>}
         </article>
     );
 }
@@ -293,46 +465,55 @@ function SettingsPanel({
     onSettingsChange: AutoSignalsPageProps['onSettingsChange'];
 }) {
     return (
-        <section className='as-settings' aria-labelledby='as-settings-heading'>
-            <div className='as-settings__intro'>
-                <div className='as-settings__title'>
-                    <span className='as-section-index'>01</span>
-                    <div>
-                        <span className='as-overline'>BOT BUILDER HANDOFF</span>
-                        <h2 id='as-settings-heading'>Execution guardrails</h2>
+        <details className='as-settings' aria-labelledby='as-settings-heading' data-testid='panel-bot-settings'>
+            <summary className='as-settings__summary'>
+                <span className='as-settings__summary-title'>
+                    <SlidersHorizontal size={14} aria-hidden='true' />
+                    <span>SETTINGS</span>
+                </span>
+                <span className='as-settings__summary-hint'>Edit</span>
+            </summary>
+            <div className='as-settings__body'>
+                <div className='as-settings__intro'>
+                    <div className='as-settings__title'>
+                        <span className='as-section-index'>01</span>
+                        <div>
+                            <span className='as-overline'>BOT BUILDER HANDOFF</span>
+                            <h2 id='as-settings-heading'>Execution guardrails</h2>
+                        </div>
                     </div>
+                    <p>Configure the limits that travel with your selected signal.</p>
                 </div>
-                <p>Configure the limits that travel with your selected signal.</p>
+                <div className='as-settings__fields'>
+                    {SETTINGS_FIELDS.map((field) => (
+                        <label className='as-field' key={field.key}>
+                            <span className='as-field__label'>{field.label}</span>
+                            <span className='as-field__input'>
+                                {field.prefix && <i>{field.prefix}</i>}
+                                <NumberField
+                                    min={field.min}
+                                    max={field.max}
+                                    step={field.step}
+                                    value={settings[field.key]}
+                                    onCommit={(next) => {
+                                        const committed = field.key === 'maxRuns' ? Math.round(next) : next;
+                                        onSettingsChange(field.key, committed as AutoSignalsSettings[typeof field.key]);
+                                    }}
+                                    aria-label={field.label}
+                                    data-testid={`input-setting-${field.key}`}
+                                />
+                                {field.key !== 'maxRuns' && field.key !== 'martingale' && <i className='as-field__currency'>{currency}</i>}
+                            </span>
+                            <small>{field.hint}</small>
+                        </label>
+                    ))}
+                </div>
+                <div className='as-settings__foot'>
+                    <ShieldCheck size={15} aria-hidden='true' />
+                    <span>Selected bots start automatically after loading. Contract duration is one tick.</span>
+                </div>
             </div>
-            <div className='as-settings__fields'>
-                {SETTINGS_FIELDS.map((field) => (
-                    <label className='as-field' key={field.key}>
-                        <span className='as-field__label'>{field.label}</span>
-                        <span className='as-field__input'>
-                            {field.prefix && <i>{field.prefix}</i>}
-                            <NumberField
-                                min={field.min}
-                                max={field.max}
-                                step={field.step}
-                                value={settings[field.key]}
-                                onCommit={(next) => {
-                                    const committed = field.key === 'maxRuns' ? Math.round(next) : next;
-                                    onSettingsChange(field.key, committed as AutoSignalsSettings[typeof field.key]);
-                                }}
-                                aria-label={field.label}
-                                data-testid={`input-setting-${field.key}`}
-                            />
-                            {field.key !== 'maxRuns' && field.key !== 'martingale' && <i className='as-field__currency'>{currency}</i>}
-                        </span>
-                        <small>{field.hint}</small>
-                    </label>
-                ))}
-            </div>
-            <div className='as-settings__foot'>
-                <ShieldCheck size={15} aria-hidden='true' />
-                <span>Press a trade button to load and start its bot. Contract duration is one tick.</span>
-            </div>
-        </section>
+        </details>
     );
 }
 
@@ -353,20 +534,132 @@ const AutoSignalsPage = ({
     onTrade,
 }: AutoSignalsPageProps) => {
     const [now, setNow] = useState(() => Date.now());
+    const [speedBoost, setSpeedBoost] = useState(isASpeedBoostEnabled());
+    const stableCardsByFamily = useRef(new Map<AutoSignalFamily, VisibleSignalCard[]>());
 
     useEffect(() => {
         const interval = window.setInterval(() => setNow(Date.now()), 1000);
         return () => window.clearInterval(interval);
     }, []);
+    useEffect(() => subscribeASpeedBoost(setSpeedBoost), []);
 
-    const visibleMarkets = useMemo(
-        () => family === 'AUTO' ? markets : markets.filter((market) => getFamily(market) === family),
-        [family, markets],
+    const visibleCards = useMemo(() => {
+        const cards = markets.flatMap((market) => {
+            const candidates = market.candidates?.length
+                ? market.candidates
+                : market.candidate
+                    ? [market.candidate]
+                    : [];
+            const filtered = family === 'AUTO'
+                ? candidates
+                : candidates.filter((candidate) => getFamily(candidate) === family);
+            if (!filtered.length) {
+                return family === 'AUTO' && !candidates.length
+                    ? [{ key: market.symbol, market, candidate: null }]
+                    : [];
+            }
+            return filtered.map((candidate) => ({
+                key: `${market.symbol}:${candidate.id}`,
+                market: { ...market, candidate },
+                candidate,
+            }));
+        });
+        const baselineComplete = markets.length > 0
+            && markets.every((market) => market.historyLoaded || market.feedState === 'error');
+        const savedCards = stableCardsByFamily.current.get(family);
+        if (!savedCards && baselineComplete) {
+            const confidenceOrder = [...cards].sort((left, right) =>
+                (right.candidate?.score ?? -1) - (left.candidate?.score ?? -1)
+                || left.market.symbol.localeCompare(right.market.symbol)
+                || left.key.localeCompare(right.key)
+            );
+            stableCardsByFamily.current.set(family, confidenceOrder);
+            return confidenceOrder;
+        }
+        if (!savedCards) return cards;
+
+        const currentByKey = new Map(cards.map((card) => [card.key, card]));
+        const rank = new Map(savedCards.map((card, index) => [card.key, index]));
+        const newCards = cards
+            .filter((card) => !rank.has(card.key))
+            .sort((left, right) =>
+                (right.candidate?.score ?? -1) - (left.candidate?.score ?? -1)
+                || left.market.symbol.localeCompare(right.market.symbol)
+                || left.key.localeCompare(right.key)
+            );
+        const latestMarkets = new Map(markets.map((market) => [market.symbol, market]));
+        const retainedSlots = savedCards.map((savedCard) => {
+            const currentCard = currentByKey.get(savedCard.key);
+            if (currentCard) return currentCard;
+            const latestMarket = latestMarkets.get(savedCard.market.symbol) ?? savedCard.market;
+            return {
+                ...savedCard,
+                market: {
+                    ...latestMarket,
+                    candidate: null,
+                    candidates: [],
+                    availableContractTypes: [],
+                },
+                candidate: null,
+            };
+        });
+        const nextCards = [...retainedSlots, ...newCards];
+        stableCardsByFamily.current.set(family, nextCards);
+        return nextCards;
+    }, [family, markets]);
+    const readyCount = markets.reduce(
+        (total, market) => total + (market.candidates ?? (market.candidate ? [market.candidate] : []))
+            .filter((candidate) => candidate.state === 'ready').length,
+        0,
     );
-    const readyCount = markets.filter((market) => market.candidate?.state === 'ready').length;
     const liveCount = markets.filter((market) => market.feedState === 'live').length;
     const statusText = status === 'error' ? 'Scanner issue' : status === 'loading' ? 'Starting scanner' : status === 'scanning' ? 'Scanning markets' : 'Scanner idle';
     const currencyLabel = displayCurrency || currency || 'USD';
+
+    // Auto-start: when enabled (default), the best current "ready" signal is loaded into Bot Builder and run
+    // without a click. Each signal id starts at most once, and nothing starts while a run is active.
+    const [autoStart, setAutoStart] = useState<boolean>(() => {
+        try {
+            return window.localStorage.getItem('marksyntrader.autosignals_autostart') !== '0';
+        } catch {
+            return true;
+        }
+    });
+    const autoStartedIds = useRef(new Set<string>());
+    const autoStartBusy = useRef(false);
+    const toggleAutoStart = () => {
+        setAutoStart((current) => {
+            const next = !current;
+            try {
+                window.localStorage.setItem('marksyntrader.autosignals_autostart', next ? '1' : '0');
+            } catch {
+                /* storage unavailable */
+            }
+            return next;
+        });
+    };
+    useEffect(() => {
+        if (!autoStart || !connected || !authorized || activeRun || autoStartBusy.current) return;
+        const pick = visibleCards.find(({ market, candidate }) => Boolean(
+            candidate
+            && candidate.state === 'ready'
+            && candidate.recommendedRuns > 0
+            && market.feedState === 'live'
+            && !autoStartedIds.current.has(candidate.id),
+        ));
+        if (!pick || !pick.candidate) return;
+        autoStartedIds.current.add(pick.candidate.id);
+        autoStartBusy.current = true;
+        const runs = getSuggestedAutoSignalRuns(pick.candidate.recommendedRuns, settings.maxRuns);
+        Promise.resolve(onTrade(
+            { ...pick.market, candidate: { ...pick.candidate, recommendedRuns: runs } },
+            'trade-only',
+        ))
+            .catch(() => undefined)
+            .finally(() => {
+                autoStartBusy.current = false;
+            });
+    }, [autoStart, connected, authorized, activeRun, visibleCards, settings.maxRuns, onTrade]);
 
     return (
         <main className='auto-signals' data-testid='page-auto-signals'>
@@ -374,7 +667,7 @@ const AutoSignalsPage = ({
                 <div className='as-header__brand'>
                     <div className='as-brand-mark' aria-hidden='true'><Signal size={20} strokeWidth={2.2} /></div>
                     <div>
-                        <span className='as-eyebrow'>DIGITTRADER <i>/</i> LIVE DERIV SCANNER</span>
+                        <span className='as-eyebrow'>MARKSYNTRADER <i>/</i> LIVE DERIV SCANNER</span>
                         <h1>AUTO <span>— SIGNALS</span></h1>
                         <p>Read the alignment. Choose the handoff.</p>
                     </div>
@@ -388,6 +681,34 @@ const AutoSignalsPage = ({
                         <ShieldCheck size={14} aria-hidden='true' />
                         <span>{authorized ? 'ACCOUNT AUTHORIZED' : 'AUTHORIZATION REQUIRED'}</span>
                     </div>
+                    <button
+                        className={`as-speed-booster ${autoStart ? 'is-active' : ''}`}
+                        type='button'
+                        aria-pressed={autoStart}
+                        aria-label={`Auto start ${autoStart ? 'on' : 'off'}`}
+                        title='When on, the best ready signal is loaded into Bot Builder and run automatically, with no confirmation.'
+                        onClick={toggleAutoStart}
+                        data-testid='button-auto-signals-autostart'
+                    >
+                        <Zap size={14} aria-hidden='true' />
+                        <span>AUTO START</span>
+                        <small>{autoStart ? 'ON' : 'OFF'}</small>
+                    </button>
+                    <button
+                        className={`as-speed-booster ${speedBoost ? 'is-active' : ''}`}
+                        type='button'
+                        aria-pressed={speedBoost}
+                        aria-label={`A-SPEED BOOST ${speedBoost ? 'on' : 'off'}`}
+                        title={speedBoost
+                            ? 'A-SPEED BOOST is on: one purchase per tick, no app-added wait. Deriv and network timing still apply.'
+                            : 'Enable A-SPEED BOOST: one purchase per tick, no app-added wait. Deriv and network timing still apply.'}
+                        onClick={() => setASpeedBoostEnabled(!speedBoost)}
+                        data-testid='button-auto-signals-speed-boost'
+                    >
+                        <Zap size={14} aria-hidden='true' />
+                        <span>A-SPEED BOOST</span>
+                        <small>{speedBoost ? 'ON' : 'OFF'}</small>
+                    </button>
                     <button
                         className='as-refresh'
                         type='button'
@@ -421,7 +742,11 @@ const AutoSignalsPage = ({
                 <div className='as-overview__stat as-overview__stat--mode'>
                     <span className='as-overline'>HANDOFF MODE</span>
                     <strong>{activeRun ? 'RUN IN PROGRESS' : 'BOT BUILDER'}</strong>
-                    <small>{activeRun ? `${activeRun.symbol} · ${activeRun.completedRuns}/${activeRun.maxRuns} runs` : `${currencyLabel} · one-tick contracts`}</small>
+                    <small>
+                        {activeRun
+                            ? `${activeRun.symbol} · ${activeRun.completedRuns}/${activeRun.maxRuns} cycles · ${activeRun.purchasesPerTick} purchases/tick`
+                            : `${currencyLabel} · one-tick contracts`}
+                    </small>
                 </div>
             </section>
 
@@ -432,7 +757,7 @@ const AutoSignalsPage = ({
                     <div className='as-scanner__heading'>
                         <div>
                             <div className='as-section-kicker'><span className='as-section-index'>02</span><span className='as-overline'>MARKET RADAR</span></div>
-                            <h2 id='as-scanner-heading'>Signal board <small data-testid='text-market-count'>{visibleMarkets.length} markets</small></h2>
+                            <h2 id='as-scanner-heading'>Signal board <small data-testid='text-market-count'>{visibleCards.length} cards</small></h2>
                         </div>
                         <div className='as-scanner__legend'>
                             <span><i className='is-pass' /> aligned</span>
@@ -458,6 +783,12 @@ const AutoSignalsPage = ({
                             ))}
                         </div>
                     </div>
+            {family === 'MATCHES' && (
+                <div className='as-match-scan-note' role='status' data-testid='text-digit-match-scan-cadence'>
+                    <Clock3 size={13} aria-hidden='true' />
+                    Digit Match rechecks all live markets every minute; live ticks update the cards between sweeps.
+                </div>
+            )}
 
                     {status === 'error' && (
                         <div className='as-alert' role='status' data-testid='status-scanner-error'>
@@ -467,14 +798,16 @@ const AutoSignalsPage = ({
                         </div>
                     )}
 
-                    {visibleMarkets.length > 0 ? (
+                    {visibleCards.length > 0 ? (
                         <div className='as-market-grid' data-testid='grid-markets'>
-                            {visibleMarkets.map((market) => (
+                            {visibleCards.map(({ key, market, candidate }) => (
                                 <MarketCard
-                                    key={market.symbol}
+                                    key={key}
                                     market={market}
+                                    candidate={candidate}
                                     now={now}
                                     currency={currencyLabel}
+                                    settings={settings}
                                     onTrade={onTrade}
                                 />
                             ))}
@@ -494,7 +827,7 @@ const AutoSignalsPage = ({
             </div>
 
             <footer className='as-footer'>
-                <span><span className='as-footer__mark'>D</span> DIGITTRADER <b>·</b> AUTO SIGNALS</span>
+                <span><span className='as-footer__mark'>M</span> MARKSYNTRADER <b>·</b> AUTO SIGNALS</span>
                 <span><span className='as-footer__signal' /> Historical tick rates are not future win probabilities; one-tick trades can lose.</span>
                 <span className='as-footer__clock'>LOCAL UPDATE {clockText(now)}</span>
             </footer>

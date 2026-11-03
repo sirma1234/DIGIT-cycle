@@ -1,0 +1,131 @@
+import {
+    startAutoSignalsBotWithRetry,
+    ensureAutoSignalWorkspaceLoaded,
+    isAutoSignalWorkspaceReady,
+    startAutoSignalsBot,
+} from './bot-builder-handoff';
+
+describe('Auto-Signals Bot Builder handoff readiness', () => {
+    const xml = '<xml><block type="trade_definition" /></xml>';
+
+    it('waits for a live workspace containing the selected bot XML', () => {
+        expect(isAutoSignalWorkspaceReady(null, xml)).toBe(false);
+        expect(isAutoSignalWorkspaceReady({
+            strategy_to_load: '<xml />',
+            getTopBlocks: () => [{}],
+        }, xml)).toBe(false);
+        expect(isAutoSignalWorkspaceReady({
+            strategy_to_load: xml,
+            getTopBlocks: () => [],
+        }, xml)).toBe(false);
+        expect(isAutoSignalWorkspaceReady({
+            strategy_to_load: xml,
+            isDisposed: () => true,
+            getTopBlocks: () => [{}],
+        }, xml)).toBe(false);
+    });
+
+    it('accepts the selected XML once Blockly has finished creating its blocks', () => {
+        expect(isAutoSignalWorkspaceReady({
+            strategy_to_load: xml,
+            isDisposed: () => false,
+            getTopBlocks: () => [{}],
+        }, xml)).toBe(true);
+    });
+
+    it('uses the live workspace loader when Bot Builder is already mounted with another bot', async () => {
+        const blocks: unknown[] = [{}];
+        const workspace = {
+            strategy_to_load: '<xml><block type="old_bot" /></xml>',
+            getTopBlocks: () => blocks,
+        };
+        const loadStrategy = jest.fn(async (
+            target: { strategy_to_load?: string },
+            selectedXml: string,
+        ) => {
+            blocks.splice(0, blocks.length, { type: 'trade_definition' });
+            target.strategy_to_load = selectedXml;
+        });
+
+        await ensureAutoSignalWorkspaceLoaded(workspace, xml, loadStrategy);
+
+        expect(loadStrategy).toHaveBeenCalledWith(workspace, xml);
+        expect(isAutoSignalWorkspaceReady(workspace, xml)).toBe(true);
+    });
+
+    it('waits for Blockly to finish creating blocks after the loader resolves', async () => {
+        let blocksReady = false;
+        const workspace = {
+            strategy_to_load: '',
+            getTopBlocks: () => blocksReady ? [{ type: 'trade_definition' }] : [],
+        };
+
+        await ensureAutoSignalWorkspaceLoaded(workspace, xml, async () => {
+            setTimeout(() => { blocksReady = true; }, 0);
+        });
+
+        expect(isAutoSignalWorkspaceReady(workspace, xml)).toBe(true);
+    });
+
+    it('automatically runs the bot as soon as the loaded workspace is ready', async () => {
+        const runPanel: { is_running: boolean; onRunButtonClick: jest.Mock } = {
+            is_running: false,
+            onRunButtonClick: jest.fn(() => {
+                runPanel.is_running = true;
+            }),
+        };
+
+        await startAutoSignalsBot(runPanel, jest.fn());
+
+        expect(runPanel.onRunButtonClick).toHaveBeenCalledTimes(1);
+        expect(runPanel.is_running).toBe(true);
+    });
+
+    it('does not treat a completed Run click as a start unless the panel is actually running', async () => {
+        await expect(startAutoSignalsBot({
+            is_running: false,
+            onRunButtonClick: async () => undefined,
+        }, jest.fn())).rejects.toThrow('Bot Builder did not start this bot');
+    });
+
+    it('reports a later start failure without waiting for the bot run to finish', async () => {
+        let rejectRun: (error: Error) => void = () => undefined;
+        let backgroundError: unknown;
+        const runPanel: { is_running: boolean; onRunButtonClick: jest.Mock } = {
+            is_running: false,
+            onRunButtonClick: jest.fn(() => {
+                runPanel.is_running = true;
+                return new Promise<void>((_resolve, reject) => {
+                    rejectRun = reject;
+                });
+            }),
+        };
+
+        await startAutoSignalsBot(runPanel, (error) => {
+            backgroundError = error;
+        });
+        rejectRun(new Error('Run failed'));
+        await Promise.resolve();
+
+        expect(backgroundError).toEqual(new Error('Run failed'));
+    });
+});
+
+describe('startAutoSignalsBotWithRetry', () => {
+    it('retries a silent no-op start and succeeds once the Builder is ready', async () => {
+        const runPanel: any = { is_running: false, calls: 0 };
+        runPanel.onRunButtonClick = jest.fn(async () => {
+            runPanel.calls += 1;
+            if (runPanel.calls >= 2) runPanel.is_running = true;
+        });
+        await startAutoSignalsBotWithRetry(runPanel, jest.fn(), 3, 1);
+        expect(runPanel.onRunButtonClick).toHaveBeenCalledTimes(2);
+        expect(runPanel.is_running).toBe(true);
+    });
+
+    it('gives up with the original error after the last attempt', async () => {
+        const runPanel: any = { is_running: false, onRunButtonClick: jest.fn(async () => undefined) };
+        await expect(startAutoSignalsBotWithRetry(runPanel, jest.fn(), 3, 1)).rejects.toThrow('did not start');
+        expect(runPanel.onRunButtonClick).toHaveBeenCalledTimes(3);
+    });
+});

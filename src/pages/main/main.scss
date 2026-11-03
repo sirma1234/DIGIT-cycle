@@ -263,6 +263,47 @@ body {
     }
 }
 
+@media (max-width: 767px) {
+    .main__mobile-run-strategy-wrapper {
+        position: fixed;
+        inset-inline-start: 0.75rem;
+        bottom: calc(5rem + env(safe-area-inset-bottom));
+        z-index: 9995;
+        pointer-events: none;
+
+        > * { pointer-events: auto; }
+
+        .toolbar__section {
+            width: auto;
+            min-width: 0;
+            margin: 0;
+            padding: 0;
+        }
+
+        .animation__wrapper {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.35rem;
+            border: 1px solid rgba(15, 23, 42, 0.16);
+            border-radius: 999px;
+            background: var(--general-main-1, #fff);
+            box-shadow: 0 5px 18px rgba(15, 23, 42, 0.2);
+        }
+
+        .animation__speed-control,
+        .animation__container {
+            display: none;
+        }
+
+        .animation__run-button,
+        .animation__stop-button,
+        .animation__pause-button,
+        .animation__resume-button {
+            min-height: 44px;
+        }
+    }
+}
+
 .bot-stopped-dialog {
     @include mobile-or-tablet-screen { padding: 2rem; }
 

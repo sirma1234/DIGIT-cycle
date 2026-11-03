@@ -493,7 +493,14 @@ const AppWrapper = observer(() => {
                 <ChartModal />
                 <TradingViewModal />
             </DesktopWrapper>
-            <MobileWrapper>{!is_open && <RunPanel />}</MobileWrapper>
+            <MobileWrapper>
+                {active_tab === BOT_BUILDER && (
+                    <div className='main__mobile-run-strategy-wrapper' data-testid='mobile-run-strategy'>
+                        <RunStrategy />
+                    </div>
+                )}
+                {!is_open && <RunPanel />}
+            </MobileWrapper>
 
             <Dialog
                 cancel_button_text={cancel_button_text || localize('Cancel')}

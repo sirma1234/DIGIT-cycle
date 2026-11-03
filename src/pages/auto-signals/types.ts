@@ -7,7 +7,7 @@ export type AutoSignalFamily =
     | 'DIFFERS'
     | 'MATCHES';
 
-export type AutoSignalAction = 'trade-only' | 'entry-trade';
+export type AutoSignalAction = 'trade-only' | 'entry-trade' | 'over-dt' | 'under-dt';
 
 export type AutoSignalTier = 'NO SIGNAL' | 'WATCH' | 'SETUP' | 'STRONG' | 'ELITE';
 
@@ -71,7 +71,10 @@ export interface AutoSignalMarket {
     latestQuote: number | null;
     updatedAt: number | null;
     feedState: 'loading' | 'live' | 'stale' | 'error' | 'unavailable';
+    /** True once the initial authenticated history request completed (or failed). */
+    historyLoaded?: boolean;
     candidate: AutoSignalCandidate | null;
+    candidates?: AutoSignalCandidate[];
     availableContractTypes: string[];
     error?: string;
 }
@@ -92,6 +95,7 @@ export interface AutoSignalsRun {
     startedAt: number;
     maxRuns: number;
     completedRuns: number;
+    purchasesPerTick: number;
 }
 
 export interface AutoSignalsPageProps {
